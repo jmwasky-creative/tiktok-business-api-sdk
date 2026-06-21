@@ -9,11 +9,14 @@
 from __future__ import absolute_import
 
 import datetime
+import logging
 import json
 import mimetypes
 from multiprocessing.pool import ThreadPool
 import os
 import re
+import threading
+import time
 import tempfile
 
 # python 2 and python 3 compatibility library
@@ -26,6 +29,59 @@ from business_api_client import rest
 from business_api_client.tiktok_business.tiktok_exceptions import TiktokSDKError
 from business_api_client.tiktok_business.tiktok_code import NumericErrorCodes
 from business_api_client.tiktok_business.tiktok_response import TikTokSDKResponse
+
+
+logger = logging.getLogger(__name__)
+
+
+class _SharedRateLimiter(object):
+    """Process-wide request limiter shared by all ApiClient instances."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def reset(self):
+        """Reset the shared limiter state for tests or reconfiguration."""
+        with self._lock:
+            self._next_request_at = 0.0
+
+    def throttle(self, qps):
+        """Sleep as needed to keep the shared request rate under qps."""
+        try:
+            qps = float(qps)
+        except (TypeError, ValueError):
+            qps = 20.0
+
+        if qps <= 0:
+            qps = 20.0
+
+        min_interval = 1.0 / qps
+
+        with self._lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self._next_request_at - now)
+            scheduled_from = max(self._next_request_at, now)
+            self._next_request_at = scheduled_from + min_interval
+            scheduled_next = self._next_request_at
+
+        logger.debug(
+            "[rate_limit] wait=%.6f qps=%.2f now=%.6f next=%.6f",
+            wait_seconds,
+            qps,
+            now,
+            scheduled_from,
+        )
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        logger.debug(
+            "[rate_limit] scheduled_next=%.6f qps=%.2f",
+            scheduled_next,
+            qps,
+        )
+
+
+_GLOBAL_RATE_LIMITER = _SharedRateLimiter()
 
 
 class ApiClient(object):
@@ -76,8 +132,15 @@ class ApiClient(object):
         self.user_agent = 'Swagger-Codegen/1.0.0/python'
 
     def __del__(self):
-        self.pool.close()
-        self.pool.join()
+        pool = getattr(self, "pool", None)
+        if pool is None:
+            return
+
+        try:
+            pool.close()
+            pool.join()
+        except Exception:
+            pass
 
     @property
     def user_agent(self):
@@ -343,6 +406,8 @@ class ApiClient(object):
                 post_params=None, body=None, _preload_content=True,
                 _request_timeout=None):
         """Makes the HTTP request using RESTClient."""
+        self._throttle_request()
+
         if method == "GET":
             return self.rest_client.GET(url,
                                         query_params=query_params,
@@ -399,6 +464,10 @@ class ApiClient(object):
                 "http method must be `GET`, `HEAD`, `OPTIONS`,"
                 " `POST`, `PATCH`, `PUT` or `DELETE`."
             )
+
+    def _throttle_request(self):
+        """Ensure the configured QPS is respected across threads."""
+        _GLOBAL_RATE_LIMITER.throttle(getattr(self.configuration, "qps", 20))
 
     def parameters_to_tuples(self, params, collection_formats):
         """Get parameters as list of tuples, formatting collections.

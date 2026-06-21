@@ -9,8 +9,10 @@
 from __future__ import absolute_import
 
 import copy
+import json
 import logging
 import multiprocessing
+import os
 import sys
 import urllib3
 
@@ -45,6 +47,8 @@ class Configuration(six.with_metaclass(TypeWithDefault, object)):
         self.host = "https://business-api.tiktok.com"
         # Temp file folder for downloading files
         self.temp_folder_path = None
+        # Request throttling, loaded from sdk_config.json.
+        self.qps = self._load_qps()
 
         # Authentication Settings
         # dict to store API key(s)
@@ -238,3 +242,25 @@ class Configuration(six.with_metaclass(TypeWithDefault, object)):
                "Version of the API: 1.2.1\n"\
                "SDK Package Version: 1.0.0".\
                format(env=sys.platform, pyversion=sys.version)
+
+    def _load_qps(self):
+        """Load request QPS from the package config file."""
+        config_path = os.path.join(os.path.dirname(__file__), "sdk_config.json")
+        default_qps = 20
+
+        try:
+            with open(config_path) as config_file:
+                config_data = json.load(config_file)
+        except (IOError, OSError, ValueError, TypeError):
+            return default_qps
+
+        qps = config_data.get("qps", default_qps)
+        try:
+            qps = float(qps)
+        except (TypeError, ValueError):
+            return default_qps
+
+        if qps <= 0:
+            return default_qps
+
+        return qps
