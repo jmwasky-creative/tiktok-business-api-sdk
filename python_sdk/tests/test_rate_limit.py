@@ -517,6 +517,95 @@ class RateLimitTests(unittest.TestCase):
         self.assertAlmostEqual(sum(sleeps), 1.95)
         self.assertEqual(results[-1]["request_id"], "req-40")
 
+    def test_report_integrated_get_one_hundred_concurrent_requests_delay(self):
+        configuration = self.configuration_module.Configuration()
+        configuration.qps = 20
+        client = self.api_client_module.ApiClient.__new__(self.api_client_module.ApiClient)
+        client.configuration = configuration
+        client.default_headers = {"Business-SDK": 1, "SDK-Language": "Py", "SDK-Version": "0.1.3"}
+        client.cookie = None
+        client.rest_client = None
+
+        call_lock = threading.Lock()
+        calls = []
+
+        class FakeResponse(object):
+            def __init__(self, request_id):
+                self.code = 0
+                self.message = ""
+                self.request_id = request_id
+                self.data = {"request_id": request_id}
+
+        def fake_get(url, **kwargs):
+            with call_lock:
+                calls.append((url, kwargs))
+                request_id = "req-%d" % len(calls)
+            return FakeResponse(request_id)
+
+        client.rest_client = types.SimpleNamespace(GET=fake_get)
+        api = self.reporting_api_module.ReportingApi(api_client=client)
+
+        worker_count = 100
+        barrier = threading.Barrier(worker_count)
+        sleeps = []
+        sleep_lock = threading.Lock()
+        results = []
+        result_lock = threading.Lock()
+        errors = []
+        error_lock = threading.Lock()
+
+        def fake_monotonic():
+            return 0.0
+
+        def fake_sleep(seconds):
+            with sleep_lock:
+                sleeps.append(seconds)
+
+        def worker():
+            try:
+                barrier.wait()
+                result = api.report_integrated_get(
+                    "BASIC",
+                    "access-token-example",
+                    advertiser_id="123456",
+                    dimensions=["stat_time_day"],
+                    metrics=["spend"],
+                    _preload_content=False,
+                )
+                with result_lock:
+                    results.append(result)
+            except Exception as exc:
+                with error_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(worker_count)]
+
+        with mock.patch.object(self.api_client_module.time, "monotonic", side_effect=fake_monotonic), \
+             mock.patch.object(self.api_client_module.time, "sleep", side_effect=fake_sleep):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(calls), worker_count)
+        self.assertEqual(len(results), worker_count)
+        self.assertEqual(len(sleeps), worker_count - 1)
+
+        sorted_sleeps = sorted(sleeps)
+        scheduled_waits = [0.0] + sorted_sleeps
+        self.assertAlmostEqual(sorted_sleeps[0], 0.05)
+        self.assertAlmostEqual(sorted_sleeps[-1], 4.95)
+        self.assertAlmostEqual(scheduled_waits[94], 4.70)
+        self.assertAlmostEqual(scheduled_waits[98], 4.90)
+        self.assertAlmostEqual(sum(sleeps), 247.5)
+        self.assertAlmostEqual(sum(sleeps) / worker_count, 2.475)
+        self.assertEqual(
+            sorted(int(result["request_id"].split("-")[1]) for result in results),
+            list(range(1, worker_count + 1)),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
